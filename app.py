@@ -1,78 +1,81 @@
 import streamlit as st
-import fitz  # PyMuPDF
 import pandas as pd
-import re
-from io import BytesIO
+import pdfplumber
 
-st.title("📦 SKU 對照工具 (PDF → Excel)")
+st.title("📦 SKU 對照工具 (PDF ➝ Excel)")
 
-# 上傳檔案
+# 上傳 PDF
 pdf_file = st.file_uploader("上傳 PDF (SKU 清單)", type=["pdf"])
+# 上傳 Excel 對照表
 excel_file = st.file_uploader("上傳 Excel (對照表)", type=["xlsx"])
 
-# 尺寸排序順序
-size_order = ["M","L","XL","2XL","3XL","4XL","5XL","6XL","7XL","8XL","9XL","10XL"]
-size_priority = {s: i for i, s in enumerate(size_order)}
-
-# 商品排序優先
-product_priority = ["TA00", "TA01", "TA03", "TB00", "TB103"]
-def product_key(name):
-    for i, p in enumerate(product_priority):
-        if name.startswith(p):
-            return (i, name)
-    return (len(product_priority), name)
-
-# 排序 key
-def parse_sort_keys(name):
-    product_match = re.match(r"([A-Z]+\d+)", name)
-    product = product_match.group(1) if product_match else name
-    color_match = re.search(r"(黑|白|灰|藍|粉|綠|卡其|棕紅|煙灰|深灰|淺灰|深藍|淺藍)", name)
-    color = color_match.group(1) if color_match else ""
-    size_match = re.search(r"(\d+XL|\d+|M|L|XL)$", name)
-    size = size_match.group(1) if size_match else ""
-    prod_key = product_key(product)
-    if size in size_priority:
-        size_key = size_priority[size]
-    else:
-        try:
-            size_key = int(size)
-        except:
-            size_key = 999
-    return (*prod_key, color, size_key)
-
 if pdf_file and excel_file:
-    # 讀 PDF
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text("text")
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    records = []
-    for i in range(0, len(lines), 3):
-        if i + 2 < len(lines):
-            records.append([lines[i], lines[i+1], lines[i+2]])
-    pdf_df = pd.DataFrame(records, columns=["系統編號", "SKU", "商品名稱"])
+    # 讀取 PDF
+    skus = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                for line in text.split("\n"):
+                    if "-" in line:  # 簡單判斷 SKU 格式
+                        skus.append(line.strip())
 
-    # 讀對照表
-    map_df = pd.read_excel(excel_file, header=1)
+    df_pdf = pd.DataFrame({"SKU": skus})
+
+    # 讀取對照表
+    df_map = pd.read_excel(excel_file)
 
     # 合併
-    merged = pdf_df.merge(map_df, left_on="SKU", right_on="平臺 SKU", how="left")
-    result = merged[["SKU", "自定義產品名稱"]].rename(columns={"自定義產品名稱": "名稱"})
+    df = df_pdf.merge(df_map, on="SKU", how="left")
 
-    # 排序
-    result_sorted = result.sort_values(
-        by=result["名稱"].apply(parse_sort_keys).tolist()
-    ).reset_index(drop=True)
+    # ========= 排序邏輯 =========
+    size_order = {"M": 1, "L": 2, "XL": 3, "2XL": 4, "3XL": 5, "4XL": 6,
+                  "5XL": 7, "6XL": 8, "7XL": 9, "8XL": 10, "9XL": 11, "10XL": 12}
+    def size_key(x):
+        return size_order.get(str(x), 999)
 
-    st.write("✅ 排序後結果：", result_sorted)
+    color_order = {"黑": 1, "白": 2, "灰": 3, "藍": 4, "卡": 5, "棕": 6}
+    def color_key(x):
+        return color_order.get(str(x), 999)
 
-    # 下載 Excel
-    output = BytesIO()
-    result_sorted.to_excel(output, index=False)
+    product_order = ["TA00", "TA01", "TA03", "TB00", "TB103"]
+    def product_key(x):
+        for i, p in enumerate(product_order):
+            if str(x).startswith(p):
+                return i
+        return 999
+
+    if "名稱" in df.columns:
+        # 拆出 商品 / 顏色 / 尺寸
+        df["商品名稱"] = df["名稱"].str.extract(r"(^[A-Z]+\d+)")
+        df["顏色"] = df["名稱"].str.extract(r"(黑|白|灰|藍|卡|棕)")
+        df["尺寸"] = df["名稱"].str.extract(r"(M|L|XL|2XL|3XL|4XL|5XL|6XL|7XL|8XL|9XL|10XL)")
+
+        df = df.sort_values(
+            by=["商品名稱", "顏色", "尺寸"],
+            key=lambda col: (
+                col.map(product_key) if col.name == "商品名稱" else
+                col.map(color_key) if col.name == "顏色" else
+                col.map(size_key)
+            )
+        )
+
+    # ========= 排序結束 =========
+
+    # 下載結果
+    st.dataframe(df)
+
+    @st.cache_data
+    def convert_excel(df):
+        from io import BytesIO
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        return output.getvalue()
+
     st.download_button(
-        label="📥 下載排序後 Excel",
-        data=output.getvalue(),
-        file_name="SKU對照_排序後.xlsx",
+        label="📥 下載 Excel",
+        data=convert_excel(df),
+        file_name="result.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
